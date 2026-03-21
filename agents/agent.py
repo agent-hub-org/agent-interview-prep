@@ -24,10 +24,11 @@ and other tech roles.
 Returns structured content including detected sections and skills.
 
 **Research delegation:**
-- `research_topic(query: str)` — Delegate a deep research query to the Research Agent. \
-Use this when the user needs in-depth technical explanations, paper summaries, or comprehensive \
-topic overviews that go beyond your knowledge. The research agent has access to arXiv papers \
-and web search.
+- `research_topic(query: str)` — Delegate a research query to the Research Agent. \
+ONLY use this for niche, recent (post-2023), or cutting-edge topics that require arXiv paper \
+summaries or web research. Do NOT use for well-known ML/CS concepts (dropout, backprop, \
+attention, transformers, common algorithms, standard data structures, classic system design \
+patterns) — answer those directly from your own knowledge. Call at most ONCE per user turn.
 
 **Note generation:**
 - `generate_study_notes(title: str, content: str, format: str)` — Generate downloadable \
@@ -64,7 +65,8 @@ to interview preparation.
 4. Use `tavily_quick_search` to find recent interview patterns for the target company
 
 ### When asked for study materials or notes:
-1. Use `research_topic` for deep technical content when needed
+1. Use `research_topic` only if the topic is niche or recent (post-2023) — for standard \
+well-known topics, compose the notes directly from your own knowledge
 2. Compose comprehensive, well-structured markdown content covering:
    - Key concepts and definitions
    - Common interview questions with approach hints

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -145,9 +146,38 @@ async def ask_stream(request: AskRequest):
 
     async def event_stream():
         full_response = []
-        async for chunk in stream:
-            full_response.append(chunk)
-            yield f"data: {json.dumps({'text': chunk})}\n\n"
+        queue: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
+
+        async def _stream_producer():
+            async for chunk in stream:
+                await queue.put(("chunk", chunk))
+            await queue.put(("done", None))
+
+        async def _keepalive_producer():
+            while True:
+                await asyncio.sleep(15)
+                await queue.put(("keepalive", None))
+
+        producer_task = asyncio.create_task(_stream_producer())
+        keepalive_task = asyncio.create_task(_keepalive_producer())
+
+        try:
+            while True:
+                kind, data = await queue.get()
+                if kind == "chunk":
+                    full_response.append(data)
+                    yield f"data: {json.dumps({'text': data})}\n\n"
+                elif kind == "keepalive":
+                    yield ": keep-alive\n\n"
+                elif kind == "done":
+                    break
+        finally:
+            keepalive_task.cancel()
+            try:
+                await keepalive_task
+            except asyncio.CancelledError:
+                pass
+            await producer_task
 
         response_text = "".join(full_response)
 

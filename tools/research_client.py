@@ -11,9 +11,13 @@ RESEARCH_AGENT_URL = os.getenv("RESEARCH_AGENT_URL", "http://localhost:9002")
 
 @tool
 async def research_topic(query: str) -> str:
-    """Delegate a deep research query to the Research Agent. Use this when the user needs
-    in-depth technical explanations, academic paper summaries, or comprehensive topic overviews
-    that go beyond your knowledge.
+    """Delegate a research query to the Research Agent.
+
+    ONLY use this for topics that are niche, recent (post-2023), or require academic paper
+    summaries. Do NOT call it for well-established concepts (e.g., dropout, backpropagation,
+    attention mechanisms, transformers, common algorithms, standard data structures, classic
+    system design patterns) — answer those directly from your own knowledge.
+    Call this tool at most ONCE per user turn.
 
     Args:
         query: The research query to send to the research agent.
