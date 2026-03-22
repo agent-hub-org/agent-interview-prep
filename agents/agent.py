@@ -7,7 +7,7 @@ from agent_sdk.checkpoint import AsyncMongoDBSaver
 from database.memory import get_memories, save_memory
 from database.mongo import MongoDB
 from tools.resume_parser import parse_resume
-from tools.research_client import research_topic
+from tools.research_client import research_topic, _current_user_id
 from tools.note_generator import generate_study_notes
 
 logger = logging.getLogger("agent_interview_prep.agent")
@@ -231,7 +231,12 @@ async def run_query(query: str, session_id: str = "default",
     enriched_query = dynamic_context + query
 
     agent = create_agent()
-    result = await agent.arun(enriched_query, session_id=session_id, system_prompt=SYSTEM_PROMPT, model_id=model_id)
+    token = _current_user_id.set(user_id)
+    try:
+        result = await agent.arun(enriched_query, session_id=session_id, system_prompt=SYSTEM_PROMPT, model_id=model_id)
+    finally:
+        _current_user_id.reset(token)
+
     logger.info("run_query finished — session='%s', steps: %d", session_id, len(result["steps"]))
 
     save_memory(user_id=user_id or session_id, query=query, response=result["response"])

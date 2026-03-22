@@ -1,5 +1,6 @@
 import logging
 import os
+from contextvars import ContextVar
 
 import httpx
 from langchain_core.tools import tool
@@ -7,6 +8,16 @@ from langchain_core.tools import tool
 logger = logging.getLogger("agent_interview_prep.tools.research_client")
 
 RESEARCH_AGENT_URL = os.getenv("RESEARCH_AGENT_URL", "http://localhost:9002")
+
+# Propagates the authenticated user_id through the async call stack so the
+# research agent can log and store memories under the correct user.
+_current_user_id: ContextVar[str | None] = ContextVar("_current_user_id", default=None)
+
+_STUDY_NOTES_CONTEXT = (
+    "\n\n[RESEARCH CONTEXT: This query is for generating comprehensive study notes. "
+    "Use your research tools (arXiv papers, Tavily web search, vector DB) to gather "
+    "thorough, in-depth information. Do NOT answer from general knowledge alone.]"
+)
 
 
 @tool
@@ -22,13 +33,19 @@ async def research_topic(query: str) -> str:
     Args:
         query: The research query to send to the research agent.
     """
-    logger.info("Delegating research query to %s: '%s'", RESEARCH_AGENT_URL, query[:100])
+    user_id = _current_user_id.get()
+    enriched_query = query + _STUDY_NOTES_CONTEXT
+    headers = {"X-User-Id": user_id} if user_id else {}
+
+    logger.info("Delegating research query to %s: '%s' (user='%s')",
+                RESEARCH_AGENT_URL, query[:100], user_id or "anonymous")
 
     try:
         async with httpx.AsyncClient(timeout=300.0) as client:
             response = await client.post(
                 f"{RESEARCH_AGENT_URL}/ask",
-                json={"query": query},
+                json={"query": enriched_query},
+                headers=headers,
             )
             response.raise_for_status()
             data = response.json()

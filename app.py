@@ -16,6 +16,7 @@ from database.auth import AuthDB
 from database.mongo import MongoDB
 from a2a_service.server import create_a2a_app
 from tools.resume_parser import parse_resume_file
+from tools.research_client import _current_user_id
 
 logging.basicConfig(
     level=logging.INFO,
@@ -180,6 +181,7 @@ async def ask_stream(request: AskRequest, http_request: Request):
     )
     enriched_query = dynamic_context + request.query
     agent = create_agent()
+    _uid_token = _current_user_id.set(user_id)
     stream = agent.astream(
         enriched_query, session_id=session_id,
         system_prompt=SYSTEM_PROMPT, model_id=request.model_id
@@ -244,6 +246,8 @@ async def ask_stream(request: AskRequest, http_request: Request):
             steps=stream.steps if hasattr(stream, 'steps') else [],
             user_id=user_id,
         )
+
+        _current_user_id.reset(_uid_token)
 
         yield f"data: {json.dumps({'session_id': session_id})}\n\n"
         yield "data: [DONE]\n\n"

@@ -9,7 +9,7 @@ from langchain_core.tools import tool
 
 logger = logging.getLogger("agent_interview_prep.tools.note_generator")
 
-_BASE_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
+_BASE_URL = (os.getenv("BACKEND_URL") or os.getenv("PUBLIC_URL") or "").rstrip("/")
 
 
 _UNICODE_TO_ASCII = str.maketrans({
