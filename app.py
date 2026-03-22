@@ -12,7 +12,7 @@ from fastapi.responses import Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from agents.agent import create_agent, run_query, _build_enriched_prompt
+from agents.agent import create_agent, run_query, _build_dynamic_context, SYSTEM_PROMPT
 from database.mongo import MongoDB
 from a2a_service.server import create_a2a_app
 from tools.resume_parser import parse_resume_file
@@ -135,13 +135,14 @@ async def ask_stream(request: AskRequest):
     session_id = request.session_id or MongoDB.generate_session_id()
     logger.info("POST /ask/stream — session='%s', query='%s'", session_id, request.query[:100])
 
-    enriched_prompt = await _build_enriched_prompt(
+    dynamic_context = await _build_dynamic_context(
         session_id, request.query, response_format=request.response_format
     )
+    enriched_query = dynamic_context + request.query
     agent = create_agent()
     stream = agent.astream(
-        request.query, session_id=session_id,
-        system_prompt=enriched_prompt, model_id=request.model_id
+        enriched_query, session_id=session_id,
+        system_prompt=SYSTEM_PROMPT, model_id=request.model_id
     )
 
     async def event_stream():

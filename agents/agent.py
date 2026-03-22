@@ -167,38 +167,36 @@ def create_agent() -> BaseAgent:
     return _agent_instance
 
 
-async def _build_enriched_prompt(session_id: str, query: str, response_format: str | None = None) -> str:
-    """Build system prompt enriched with date context, memories, resume, and response format."""
+async def _build_dynamic_context(session_id: str, query: str, response_format: str | None = None) -> str:
+    """Build dynamic context block (date, memories, resume, format instructions) to prepend to the user query."""
     memories = get_memories(user_id=session_id, query=query)
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    date_block = (
-        f"\n\nTODAY'S DATE: {today}\n"
-        "Use this to provide up-to-date preparation advice."
-    )
+    year = today[:4]
 
-    enriched_prompt = SYSTEM_PROMPT + date_block
+    parts = []
+    parts.append(f"Today's date: {today}. Include the year ({year}) in search queries.")
 
     if memories:
-        memory_block = "\n".join(f"- {m}" for m in memories)
-        enriched_prompt += f"\n\nCONTEXT ABOUT THIS USER (from long-term memory, use this to personalize your response):\n{memory_block}"
-        logger.info("Injected %d memories into system_prompt for session='%s'", len(memories), session_id)
+        memory_lines = "\n".join(f"- {m}" for m in memories)
+        parts.append(f"User context (long-term memory):\n{memory_lines}")
+        logger.info("Injected %d memories into context for session='%s'", len(memories), session_id)
 
-    # Inject parsed resume if available for this session
     resume_doc = await MongoDB.get_resume(session_id)
     if resume_doc:
-        enriched_prompt += (
-            f"\n\nUSER'S RESUME (uploaded and parsed — reference this for personalized advice):\n"
+        parts.append(
+            f"User's resume (uploaded — reference for personalized advice):\n"
             f"File: {resume_doc['filename']}\n"
             f"{resume_doc['parsed_text']}"
         )
-        logger.info("Injected resume into system_prompt for session='%s'", session_id)
+        logger.info("Injected resume into context for session='%s'", session_id)
 
     format_instruction = RESPONSE_FORMAT_INSTRUCTIONS.get(response_format or "detailed", "")
     if format_instruction:
-        enriched_prompt += format_instruction
+        parts.append(format_instruction.strip())
 
-    return enriched_prompt
+    context_block = "\n\n".join(parts)
+    return f"[CONTEXT]\n{context_block}\n[/CONTEXT]\n\n"
 
 
 async def run_query(query: str, session_id: str = "default",
@@ -206,10 +204,11 @@ async def run_query(query: str, session_id: str = "default",
     logger.info("run_query called — session='%s', query='%s', model='%s'",
                 session_id, query[:100], model_id or "default")
 
-    enriched_prompt = await _build_enriched_prompt(session_id, query, response_format=response_format)
+    dynamic_context = await _build_dynamic_context(session_id, query, response_format=response_format)
+    enriched_query = dynamic_context + query
 
     agent = create_agent()
-    result = await agent.arun(query, session_id=session_id, system_prompt=enriched_prompt, model_id=model_id)
+    result = await agent.arun(enriched_query, session_id=session_id, system_prompt=SYSTEM_PROMPT, model_id=model_id)
     logger.info("run_query finished — session='%s', steps: %d", session_id, len(result["steps"]))
 
     save_memory(user_id=session_id, query=query, response=result["response"])
@@ -221,13 +220,11 @@ def create_stream(query: str, session_id: str = "default",
                   response_format: str | None = None, model_id: str | None = None):
     """Create a StreamResult for the query. Returns the stream object directly.
 
-    Note: _build_enriched_prompt is async but we need the result synchronously here.
-    The enriched prompt is built inside the stream wrapper instead.
+    Note: _build_dynamic_context is async; the caller (app.py) awaits it and calls agent.astream() directly.
     """
     logger.info("create_stream called — session='%s', query='%s', model='%s'",
                 session_id, query[:100], model_id or "default")
 
     agent = create_agent()
-    # We need to build the enriched prompt before streaming.
-    # This is handled by the caller (app.py) which awaits _build_enriched_prompt first.
+    # Dynamic context is built by the caller (app.py) which awaits _build_dynamic_context first.
     return agent, session_id, response_format, model_id
