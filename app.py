@@ -5,14 +5,14 @@ import os
 import tempfile
 import uuid
 from contextlib import asynccontextmanager
-
 import uvicorn
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from agents.agent import create_agent, run_query, _build_dynamic_context, SYSTEM_PROMPT
+from agents.agent import create_agent, run_query, _build_dynamic_context, SYSTEM_PROMPT, save_memory
+from database.auth import AuthDB
 from database.mongo import MongoDB
 from a2a_service.server import create_a2a_app
 from tools.resume_parser import parse_resume_file
@@ -33,6 +33,7 @@ ALLOWED_EXTENSIONS = {".pdf", ".docx"}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    await AuthDB.ensure_index()
     agent = create_agent()
     await agent._ensure_initialized()
     logger.info("MCP servers connected, agent ready")
@@ -72,6 +73,40 @@ class AskRequest(BaseModel):
     model_config = {"json_schema_extra": {"examples": [{"query": "", "session_id": None, "response_format": "detailed", "model_id": None}]}}
 
 
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class AuthResponse(BaseModel):
+    user_id: str
+    email: str
+
+
+# ── Auth endpoints ──
+
+@app.post("/auth/register", response_model=AuthResponse)
+async def register(request: RegisterRequest):
+    existing = await AuthDB.get_user_by_email(request.email)
+    if existing:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
+    user = await AuthDB.create_user(request.email, request.password)
+    return AuthResponse(user_id=user["user_id"], email=user["email"])
+
+
+@app.post("/auth/login", response_model=AuthResponse)
+async def login(request: LoginRequest):
+    user = await AuthDB.get_user_by_email(request.email)
+    if not user or not AuthDB.verify_password(request.password, user["password_hash"]):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
+    return AuthResponse(user_id=user["user_id"], email=user["email"])
+
+
 class AskResponse(BaseModel):
     session_id: str
     query: str
@@ -99,15 +134,17 @@ class FileListItem(BaseModel):
 # ── Standard agent endpoints ──
 
 @app.post("/ask", response_model=AskResponse)
-async def ask(request: AskRequest):
+async def ask(request: AskRequest, http_request: Request):
+    user_id = http_request.headers.get("X-User-Id") or None
     is_new = request.session_id is None
     session_id = request.session_id or MongoDB.generate_session_id()
 
-    logger.info("POST /ask — session='%s' (%s), query='%s'",
-                session_id, "new" if is_new else "existing", request.query[:100])
+    logger.info("POST /ask — session='%s' (%s), user='%s', query='%s'",
+                session_id, "new" if is_new else "existing", user_id or "anonymous", request.query[:100])
 
     result = await run_query(request.query, session_id=session_id,
-                             response_format=request.response_format, model_id=request.model_id)
+                             response_format=request.response_format, model_id=request.model_id,
+                             user_id=user_id)
     response = result["response"]
     steps = result["steps"]
 
@@ -116,6 +153,7 @@ async def ask(request: AskRequest):
         query=request.query,
         response=response,
         steps=steps,
+        user_id=user_id,
     )
 
     logger.info("POST /ask complete — session='%s', response length: %d chars, tool_calls: %d",
@@ -130,13 +168,15 @@ async def ask(request: AskRequest):
 
 
 @app.post("/ask/stream")
-async def ask_stream(request: AskRequest):
+async def ask_stream(request: AskRequest, http_request: Request):
+    user_id = http_request.headers.get("X-User-Id") or None
     """Stream the agent's response as Server-Sent Events (SSE)."""
     session_id = request.session_id or MongoDB.generate_session_id()
-    logger.info("POST /ask/stream — session='%s', query='%s'", session_id, request.query[:100])
+    logger.info("POST /ask/stream — session='%s', user='%s', query='%s'",
+                session_id, user_id or "anonymous", request.query[:100])
 
     dynamic_context = await _build_dynamic_context(
-        session_id, request.query, response_format=request.response_format
+        session_id, request.query, response_format=request.response_format, user_id=user_id
     )
     enriched_query = dynamic_context + request.query
     agent = create_agent()
@@ -195,20 +235,30 @@ async def ask_stream(request: AskRequest):
             yield f"data: {json.dumps({'text': fallback})}\n\n"
             response_text = fallback
 
-        from agents.agent import save_memory
-        save_memory(user_id=session_id, query=request.query, response=response_text)
+        save_memory(user_id=user_id or session_id, query=request.query, response=response_text)
 
         await MongoDB.save_conversation(
             session_id=session_id,
             query=request.query,
             response=response_text,
             steps=stream.steps if hasattr(stream, 'steps') else [],
+            user_id=user_id,
         )
 
         yield f"data: {json.dumps({'session_id': session_id})}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.get("/history/user/me", response_model=HistoryResponse)
+async def get_history_by_user(http_request: Request):
+    user_id = http_request.headers.get("X-User-Id") or None
+    if not user_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    logger.info("GET /history/user/me — user='%s'", user_id)
+    history = await MongoDB.get_history_by_user(user_id)
+    return HistoryResponse(session_id=user_id, history=history)
 
 
 @app.get("/history/{session_id}", response_model=HistoryResponse)

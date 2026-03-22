@@ -167,9 +167,11 @@ def create_agent() -> BaseAgent:
     return _agent_instance
 
 
-async def _build_dynamic_context(session_id: str, query: str, response_format: str | None = None) -> str:
+async def _build_dynamic_context(session_id: str, query: str, response_format: str | None = None,
+                                  user_id: str | None = None) -> str:
     """Build dynamic context block (date, memories, resume, format instructions) to prepend to the user query."""
-    memories = get_memories(user_id=session_id, query=query)
+    mem_key = user_id or session_id
+    memories = get_memories(user_id=mem_key, query=query)
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     year = today[:4]
@@ -200,18 +202,19 @@ async def _build_dynamic_context(session_id: str, query: str, response_format: s
 
 
 async def run_query(query: str, session_id: str = "default",
-                    response_format: str | None = None, model_id: str | None = None) -> dict:
-    logger.info("run_query called — session='%s', query='%s', model='%s'",
-                session_id, query[:100], model_id or "default")
+                    response_format: str | None = None, model_id: str | None = None,
+                    user_id: str | None = None) -> dict:
+    logger.info("run_query called — session='%s', user='%s', query='%s', model='%s'",
+                session_id, user_id or "anonymous", query[:100], model_id or "default")
 
-    dynamic_context = await _build_dynamic_context(session_id, query, response_format=response_format)
+    dynamic_context = await _build_dynamic_context(session_id, query, response_format=response_format, user_id=user_id)
     enriched_query = dynamic_context + query
 
     agent = create_agent()
     result = await agent.arun(enriched_query, session_id=session_id, system_prompt=SYSTEM_PROMPT, model_id=model_id)
     logger.info("run_query finished — session='%s', steps: %d", session_id, len(result["steps"]))
 
-    save_memory(user_id=session_id, query=query, response=result["response"])
+    save_memory(user_id=user_id or session_id, query=query, response=result["response"])
 
     return result
 
