@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import tempfile
 import uuid
 from contextlib import asynccontextmanager
@@ -17,6 +18,86 @@ from database.mongo import MongoDB
 from a2a_service.server import create_a2a_app
 from tools.resume_parser import parse_resume_file
 from tools.research_client import _current_user_id
+
+def _fix_math_delimiters(text: str) -> str:
+    """Convert LaTeX parenthesis delimiters to Markdown math notation.
+
+    \\[...\\]  →  $$...$$   (display math — must run before inline to avoid overlap)
+    \\(...\\)  →  $...$     (inline math)
+    """
+    text = re.sub(r'\\\[(.*?)\\\]', lambda m: f'$$\n{m.group(1)}\n$$', text, flags=re.DOTALL)
+    text = re.sub(r'\\\((.*?)\\\)', r'$\1$', text)
+    return text
+
+
+class StreamingMathFixer:
+    """Wraps an async chunk stream and converts \\(...\\) / \\[...\\] math delimiters on-the-fly.
+
+    Non-math text is yielded immediately so the streaming feel is preserved.
+    Math sections are buffered only until their closing delimiter arrives,
+    then emitted with the correct $...$ / $$...$$ notation.
+    """
+
+    def __init__(self, source):
+        self._source = source
+
+    async def __aiter__(self):
+        buffer = ""
+        in_math = False   # inside \( ... \)
+        in_block = False  # inside \[ ... \]
+
+        async for chunk in self._source:
+            buffer += chunk
+            result = ""
+
+            while buffer:
+                if not in_math and not in_block:
+                    bi = buffer.find("\\[")
+                    ii = buffer.find("\\(")
+                    if bi == -1 and ii == -1:
+                        if len(buffer) > 1:
+                            result += buffer[:-1]
+                            buffer = buffer[-1:]
+                        break
+                    if bi == -1 or (ii != -1 and ii < bi):
+                        result += buffer[:ii]
+                        buffer = buffer[ii + 2:]
+                        in_math = True
+                    else:
+                        result += buffer[:bi]
+                        buffer = buffer[bi + 2:]
+                        in_block = True
+                elif in_math:
+                    close = buffer.find("\\)")
+                    if close == -1:
+                        break
+                    result += "$" + buffer[:close] + "$"
+                    buffer = buffer[close + 2:]
+                    in_math = False
+                else:  # in_block
+                    close = buffer.find("\\]")
+                    if close == -1:
+                        break
+                    result += "$$\n" + buffer[:close] + "\n$$"
+                    buffer = buffer[close + 2:]
+                    in_block = False
+
+            if result:
+                yield result
+
+        # Flush any remaining buffer after the source stream ends
+        if buffer:
+            if in_math:
+                yield "$" + buffer + "$"
+            elif in_block:
+                yield "$$\n" + buffer + "\n$$"
+            else:
+                yield buffer
+
+    @property
+    def steps(self):
+        return self._source.steps
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -146,7 +227,7 @@ async def ask(request: AskRequest, http_request: Request):
     result = await run_query(request.query, session_id=session_id,
                              response_format=request.response_format, model_id=request.model_id,
                              user_id=user_id)
-    response = result["response"]
+    response = _fix_math_delimiters(result["response"])
     steps = result["steps"]
 
     await MongoDB.save_conversation(
@@ -182,10 +263,10 @@ async def ask_stream(request: AskRequest, http_request: Request):
     enriched_query = dynamic_context + request.query
     agent = create_agent()
     
-    stream = agent.astream(
+    stream = StreamingMathFixer(agent.astream(
         enriched_query, session_id=session_id,
         system_prompt=SYSTEM_PROMPT, model_id=request.model_id
-    )
+    ))
 
     async def event_stream():
         # Set the token INSIDE the streaming context generator
