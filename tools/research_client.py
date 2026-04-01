@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from contextvars import ContextVar
@@ -12,6 +13,9 @@ RESEARCH_AGENT_URL = os.getenv("RESEARCH_AGENT_URL", "http://localhost:9002")
 # Propagates the authenticated user_id through the async call stack so the
 # research agent can log and store memories under the correct user.
 _current_user_id: ContextVar[str | None] = ContextVar("_current_user_id", default=None)
+
+# Propagates the incoming request correlation ID through to the delegated call.
+_current_request_id: ContextVar[str | None] = ContextVar("_current_request_id", default=None)
 
 _STUDY_NOTES_CONTEXT = (
     "\n\n[RESEARCH CONTEXT: This query is for generating comprehensive study notes. "
@@ -34,34 +38,55 @@ async def research_topic(query: str) -> str:
         query: The research query to send to the research agent.
     """
     user_id = _current_user_id.get()
+    request_id = _current_request_id.get()
     enriched_query = query + _STUDY_NOTES_CONTEXT
-    headers = {"X-User-Id": user_id} if user_id else {}
+    headers: dict[str, str] = {}
+    if user_id:
+        headers["X-User-Id"] = user_id
+    if request_id:
+        headers["X-Request-ID"] = request_id
 
     logger.info("Delegating research query to %s: '%s' (user='%s')",
                 RESEARCH_AGENT_URL, query[:100], user_id or "anonymous")
 
-    try:
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            response = await client.post(
-                f"{RESEARCH_AGENT_URL}/ask",
-                json={"query": enriched_query},
-                headers=headers,
-            )
-            response.raise_for_status()
-            data = response.json()
-            result = data.get("response", "")
-            logger.info("Research agent returned %d chars", len(result))
-            return result
+    _MAX_RETRIES = 2
+    for attempt in range(_MAX_RETRIES):
+        try:
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                response = await client.post(
+                    f"{RESEARCH_AGENT_URL}/ask",
+                    json={"query": enriched_query},
+                    headers=headers,
+                )
+                response.raise_for_status()
+                data = response.json()
+                result = data.get("response", "")
+                logger.info("Research agent returned %d chars", len(result))
+                return result
 
-    except httpx.TimeoutException:
-        logger.error("Research agent timed out for query: '%s'", query[:100])
-        return "The research agent timed out. Please try a more specific query."
-    except httpx.HTTPStatusError as e:
-        logger.error("Research agent returned %d: %s", e.response.status_code, e)
-        return f"Research agent error (HTTP {e.response.status_code}). It may be unavailable."
-    except httpx.ConnectError:
-        logger.error("Cannot connect to research agent at %s", RESEARCH_AGENT_URL)
-        return (
-            "Cannot connect to the research agent. "
-            "Please ensure it is running and try again."
-        )
+        except httpx.TimeoutException:
+            logger.error("Research agent timed out for query: '%s'", query[:100])
+            return "The research agent timed out. Please try a more specific query."
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code < 500 or attempt == _MAX_RETRIES - 1:
+                logger.error("Research agent returned %d: %s", e.response.status_code, e)
+                return f"Research agent error (HTTP {e.response.status_code}). It may be unavailable."
+            logger.warning(
+                "Research agent HTTP %d (attempt %d/%d) — retrying in %ds",
+                e.response.status_code, attempt + 1, _MAX_RETRIES, 2 ** attempt,
+            )
+            await asyncio.sleep(2 ** attempt)
+        except httpx.ConnectError:
+            if attempt == _MAX_RETRIES - 1:
+                logger.error("Cannot connect to research agent at %s", RESEARCH_AGENT_URL)
+                return (
+                    "Cannot connect to the research agent. "
+                    "Please ensure it is running and try again."
+                )
+            logger.warning(
+                "Research agent unreachable (attempt %d/%d) — retrying in %ds",
+                attempt + 1, _MAX_RETRIES, 2 ** attempt,
+            )
+            await asyncio.sleep(2 ** attempt)
+    # Unreachable, but satisfies type checker
+    return "Research agent unavailable after retries."
