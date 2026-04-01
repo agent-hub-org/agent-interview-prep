@@ -11,9 +11,11 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, sta
 from fastapi.responses import Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from agents.agent import create_agent, run_query, _build_dynamic_context, SYSTEM_PROMPT, save_memory
-from database.auth import AuthDB
 from database.mongo import MongoDB
 from a2a_service.server import create_a2a_app
 from tools.resume_parser import parse_resume_file
@@ -105,6 +107,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("agent_interview_prep.api")
+limiter = Limiter(key_func=get_remote_address)
 
 ALLOWED_CONTENT_TYPES = {
     "application/pdf",
@@ -115,7 +118,6 @@ ALLOWED_EXTENSIONS = {".pdf", ".docx"}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await AuthDB.ensure_index()
     agent = create_agent()
     await agent._ensure_initialized()
     logger.info("MCP servers connected, agent ready")
@@ -131,13 +133,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:5173")
+_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=_allowed_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # Mount the A2A server as a sub-application
 a2a_app = create_a2a_app()
@@ -155,38 +156,6 @@ class AskRequest(BaseModel):
     model_config = {"json_schema_extra": {"examples": [{"query": "", "session_id": None, "response_format": "detailed", "model_id": None}]}}
 
 
-class RegisterRequest(BaseModel):
-    email: str
-    password: str
-
-
-class LoginRequest(BaseModel):
-    email: str
-    password: str
-
-
-class AuthResponse(BaseModel):
-    user_id: str
-    email: str
-
-
-# ── Auth endpoints ──
-
-@app.post("/auth/register", response_model=AuthResponse)
-async def register(request: RegisterRequest):
-    existing = await AuthDB.get_user_by_email(request.email)
-    if existing:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
-    user = await AuthDB.create_user(request.email, request.password)
-    return AuthResponse(user_id=user["user_id"], email=user["email"])
-
-
-@app.post("/auth/login", response_model=AuthResponse)
-async def login(request: LoginRequest):
-    user = await AuthDB.get_user_by_email(request.email)
-    if not user or not AuthDB.verify_password(request.password, user["password_hash"]):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
-    return AuthResponse(user_id=user["user_id"], email=user["email"])
 
 
 class AskResponse(BaseModel):
@@ -216,6 +185,7 @@ class FileListItem(BaseModel):
 # ── Standard agent endpoints ──
 
 @app.post("/ask", response_model=AskResponse)
+@limiter.limit("30/minute")
 async def ask(request: AskRequest, http_request: Request):
     user_id = http_request.headers.get("X-User-Id") or None
     is_new = request.session_id is None
@@ -250,6 +220,7 @@ async def ask(request: AskRequest, http_request: Request):
 
 
 @app.post("/ask/stream")
+@limiter.limit("30/minute")
 async def ask_stream(request: AskRequest, http_request: Request):
     """Stream the agent's response as Server-Sent Events (SSE)."""
     user_id = http_request.headers.get("X-User-Id") or None
@@ -482,4 +453,6 @@ async def health():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 9003))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    ssl_certfile = os.getenv("SSL_CERTFILE") or None
+    ssl_keyfile = os.getenv("SSL_KEYFILE") or None
+    uvicorn.run(app, host="0.0.0.0", port=port, ssl_certfile=ssl_certfile, ssl_keyfile=ssl_keyfile)
