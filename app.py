@@ -9,14 +9,14 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status, Depends
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from agents.agent import create_agent, run_query, _build_dynamic_context, _build_system_prompt, SYSTEM_PROMPT, save_memory, _fix_flash_card_format
+from agents.agent import create_agent, run_query, create_stream, save_memory, _fix_flash_card_format
 from database.mongo import MongoDB
 from a2a_service.server import create_a2a_app
 from tools.resume_parser import parse_resume_file
@@ -167,6 +167,14 @@ _raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localh
 _allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=_allowed_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
+@app.middleware("http")
+async def verify_internal_key(request: Request, call_next):
+    if request.url.path not in ["/health", "/docs", "/openapi.json"]:
+        expected = os.getenv("INTERNAL_API_KEY")
+        if expected and request.headers.get("X-Internal-API-Key") != expected:
+            return JSONResponse(status_code=status.HTTP_401_UNAUTHORIZED, content={"detail": "Unauthorized internal access"})
+    return await call_next(request)
+
 # Mount the A2A server as a sub-application
 a2a_app = create_a2a_app()
 app.mount("/a2a", a2a_app.build())
@@ -269,17 +277,12 @@ async def ask_stream(body: AskRequest, request: Request):
     logger.info("POST /ask/stream — session='%s', user='%s', query='%s'",
                 session_id, user_id or "anonymous", body.query[:100])
 
-    dynamic_context = await _build_dynamic_context(
-        session_id, body.query, response_format=body.response_format, user_id=user_id
+    stream = await create_stream(
+        body.query, session_id=session_id,
+        response_format=body.response_format, model_id=body.model_id,
+        user_id=user_id
     )
-    enriched_query = dynamic_context + body.query
-    system_prompt = _build_system_prompt(body.response_format)
-    agent = create_agent()
-    
-    stream = StreamingMathFixer(agent.astream(
-        enriched_query, session_id=session_id,
-        system_prompt=system_prompt, model_id=body.model_id
-    ))
+    stream = StreamingMathFixer(stream)
 
     _incoming_request_id = request.headers.get("X-Request-ID")
     async def event_stream():
