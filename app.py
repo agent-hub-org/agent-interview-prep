@@ -132,6 +132,7 @@ ALLOWED_CONTENT_TYPES = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
 ALLOWED_EXTENSIONS = {".pdf", ".docx"}
+MAX_RESUME_SIZE = 10 * 1024 * 1024  # 10 MB
 
 
 @asynccontextmanager
@@ -414,6 +415,12 @@ async def upload_resume(
 
         file_id = uuid.uuid4().hex
         file_bytes = await file.read()
+
+        if len(file_bytes) > MAX_RESUME_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File size ({len(file_bytes) // (1024 * 1024)} MB) exceeds the 10 MB limit.",
+            )
 
         logger.info("Received resume upload — session='%s', user='%s', file_id='%s', size=%d bytes",
                     session_id, user_id or "anonymous", file_id, len(file_bytes))
