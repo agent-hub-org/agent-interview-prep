@@ -25,6 +25,8 @@ dependencies = [
     "fpdf2 (>=2.7.0)",
     "bcrypt (>=4.0.0)",
     "slowapi>=0.1.9",
+    "prometheus-client (>=0.21.1,<1.0.0)",
+    "networkx (>=3.0,<4.0.0)"
 ]
 
 [tool.poetry]
