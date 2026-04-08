@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import tempfile
 import uuid
 from contextlib import asynccontextmanager
@@ -28,6 +29,10 @@ configure_logging("agent_interview_prep")
 logger = logging.getLogger("agent_interview_prep.api")
 limiter = Limiter(key_func=get_remote_address)
 
+_GITHUB_REPO_RE = re.compile(
+    r'^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(/[^\s]*)?$'
+)
+
 ALLOWED_CONTENT_TYPES = {
     "application/pdf",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -38,6 +43,8 @@ MAX_RESUME_SIZE = 10 * 1024 * 1024  # 10 MB
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if not os.getenv("INTERNAL_API_KEY"):
+        logger.warning("INTERNAL_API_KEY is not set — internal API is unprotected. Set this in production.")
     agent = create_agent()
     await agent._ensure_initialized()
     logger.info("MCP servers connected, agent ready")
@@ -95,6 +102,15 @@ async def verify_internal_key(request: Request, call_next):
         if expected and request.headers.get("X-Internal-API-Key") != expected:
             return JSONResponse(status_code=status.HTTP_401_UNAUTHORIZED, content={"detail": "Unauthorized internal access"})
     return await call_next(request)
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
 
 # Mount the A2A server as a sub-application
 a2a_app = create_a2a_app()
@@ -299,6 +315,7 @@ async def ask_stream(body: AskRequest, request: Request):
 
 
 @app.get("/history/user/me", response_model=HistoryResponse)
+@limiter.limit("60/minute")
 async def get_history_by_user(http_request: Request):
     user_id = http_request.headers.get("X-User-Id") or None
     if not user_id:
@@ -309,11 +326,24 @@ async def get_history_by_user(http_request: Request):
 
 
 @app.get("/history/{session_id}", response_model=HistoryResponse)
-async def get_history(session_id: str):
+@limiter.limit("60/minute")
+async def get_history(request: Request, session_id: str):
     logger.info("GET /history — session='%s'", session_id)
     history = await MongoDB.get_history(session_id)
     logger.info("Returning %d history entries for session='%s'", len(history), session_id)
     return HistoryResponse(session_id=session_id, history=history)
+
+
+class SessionsHistoryRequest(BaseModel):
+    session_ids: list[str]
+
+@app.post("/history/sessions")
+@limiter.limit("30/minute")
+async def get_history_by_sessions(request: Request, body: SessionsHistoryRequest):
+    safe_ids = [s for s in body.session_ids[:20] if isinstance(s, str) and s.isalnum() and len(s) <= 64]
+    logger.info("POST /history/sessions — %d session(s)", len(safe_ids))
+    history = await MongoDB.get_history_by_sessions(safe_ids)
+    return {"history": history}
 
 
 # ── File upload/download endpoints ──
@@ -360,7 +390,7 @@ async def upload_resume(
             parsed = parse_resume_file(tmp_path)
         except Exception as e:
             logger.error("Failed to parse uploaded resume: %s", e)
-            raise HTTPException(status_code=422, detail=f"Failed to parse resume: {e}")
+            raise HTTPException(status_code=422, detail="Failed to parse the uploaded file. Ensure it is a valid PDF or DOCX.")
         finally:
             os.unlink(tmp_path)
 
@@ -455,6 +485,8 @@ async def upload_codebase(
     github_url = github_url.strip()
     if not github_url:
         raise HTTPException(status_code=400, detail="github_url is required.")
+    if not _GITHUB_REPO_RE.match(github_url):
+        raise HTTPException(status_code=400, detail="Only public GitHub repository URLs are supported (https://github.com/owner/repo).")
 
     logger.info("POST /upload/codebase — session='%s', url='%s'", session_id, github_url)
 
