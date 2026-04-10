@@ -51,5 +51,5 @@ INTERVIEW_PREP_AGENT_CARD = AgentCard(
     ],
     defaultInputModes=["text"],
     defaultOutputModes=["text"],
-    capabilities=AgentCapabilities(streaming=False, pushNotifications=False),
+    capabilities=AgentCapabilities(streaming=True, pushNotifications=False),
 )
