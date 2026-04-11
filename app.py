@@ -230,81 +230,79 @@ async def ask_stream(body: AskRequest, request: Request):
         _uid_token = _current_user_id.set(user_id)
         _rid_token = _current_request_id.set(_incoming_request_id)
 
-        try:
-            full_response = []
-            queue: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
+        full_response = []
+        queue = asyncio.Queue()
+        _PROGRESS_PREFIX = "__PROGRESS__:"
+        _HEARTBEAT_INTERVAL = 15.0
 
-            async def _stream_producer():
-                try:
-                    async with asyncio.timeout(_STREAM_TIMEOUT):
-                        async for chunk in stream:
-                            await queue.put(("chunk", chunk))
-                    await queue.put(("done", None))
-                except TimeoutError:
-                    logger.error("Stream producer timed out after %.0fs", _STREAM_TIMEOUT)
-                    await queue.put(("error", f"Response timed out after {_STREAM_TIMEOUT:.0f}s."))
-                except Exception as exc:
-                    logger.error("Stream producer failed: %s", exc)
-                    await queue.put(("error", str(exc)))
-
-            async def _keepalive_producer():
-                while True:
-                    await asyncio.sleep(15)
-                    await queue.put(("keepalive", None))
-
-            producer_task = asyncio.create_task(_stream_producer())
-            keepalive_task = asyncio.create_task(_keepalive_producer())
-
+        async def heartbeat_worker():
             try:
                 while True:
-                    kind, data = await queue.get()
-                    if kind == "chunk":
-                        if isinstance(data, str) and data.startswith("__PROGRESS__:"):
-                            phase_label = data[len("__PROGRESS__:"):]
-                            yield f"event: progress\ndata: {json.dumps({'phase': phase_label})}\n\n"
-                        else:
-                            full_response.append(data)
-                            yield f"data: {json.dumps({'text': data})}\n\n"
-                    elif kind == "keepalive":
-                        yield ": keep-alive\n\n"
-                    elif kind == "error":
-                        error_msg = "An error occurred processing your request. Please try again or switch to a different model."
-                        yield f"data: {json.dumps({'text': error_msg})}\n\n"
-                        break
-                    elif kind == "done":
-                        break
+                    await asyncio.sleep(_HEARTBEAT_INTERVAL)
+                    await queue.put(f": heartbeat {int(asyncio.get_event_loop().time())}\n\n")
+            except asyncio.CancelledError:
+                pass
+
+        async def agent_worker():
+            try:
+                async with asyncio.timeout(_STREAM_TIMEOUT):
+                    async for chunk in stream:
+                        await queue.put(chunk)
+            except TimeoutError:
+                logger.error("Stream producer timed out after %.0fs", _STREAM_TIMEOUT)
+                await queue.put(f"__ERROR__:Response timed out after {_STREAM_TIMEOUT:.0f} seconds.")
+            except Exception as exc:
+                logger.error("Stream producer failed: %s", exc)
+                await queue.put("__ERROR__:An internal error occurred while generating the response.")
             finally:
-                keepalive_task.cancel()
-                try:
-                    await keepalive_task
-                except asyncio.CancelledError:
-                    pass
-                await producer_task
+                await queue.put(None)
+
+        heartbeat_task = asyncio.create_task(heartbeat_worker())
+        agent_task = asyncio.create_task(agent_worker())
+
+        try:
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+
+                if isinstance(chunk, str):
+                    if chunk.startswith(": heartbeat"):
+                        yield chunk
+                    elif chunk.startswith(_PROGRESS_PREFIX):
+                        phase_label = chunk[len(_PROGRESS_PREFIX):]
+                        yield f"event: progress\ndata: {json.dumps({'phase': phase_label})}\n\n"
+                    elif chunk.startswith("__ERROR__:"):
+                        error_msg = chunk[len("__ERROR__:"):]
+                        yield f"event: error\ndata: {json.dumps({'message': error_msg})}\n\n"
+                        fallback = f"\n\n[{error_msg}]"
+                        yield f"data: {json.dumps({'text': fallback})}\n\n"
+                        full_response.append(fallback)
+                    else:
+                        full_response.append(chunk)
+                        yield f"data: {json.dumps({'text': chunk})}\n\n"
 
             response_text = "".join(full_response)
-
             if not response_text.strip():
-                fallback = "Sorry, the model returned an empty response. Please try again or switch to a different model."
+                fallback = "Sorry, the model returned an empty response. Please try again."
                 yield f"data: {json.dumps({'text': fallback})}\n\n"
                 response_text = fallback
 
             try:
                 save_memory(user_id=user_id or session_id, query=body.query, response=response_text)
-
                 await MongoDB.save_conversation(
-                    session_id=session_id,
-                    query=body.query,
-                    response=response_text,
+                    session_id=session_id, query=body.query, response=response_text,
                     steps=raw_stream.steps if hasattr(raw_stream, 'steps') else [],
-                    user_id=user_id,
-                    plan=raw_stream.plan if hasattr(raw_stream, 'plan') else None,
+                    user_id=user_id, plan=raw_stream.plan if hasattr(raw_stream, 'plan') else None,
                 )
             except Exception as e:
-                logger.error("Failed to save memory/conversation: %s", e)
+                logger.error("Failed to save conversation: %s", e)
 
             yield f"data: {json.dumps({'session_id': session_id})}\n\n"
             
         finally:
+            heartbeat_task.cancel()
+            await agent_task
             yield "data: [DONE]\n\n"
             # Safely reset the tokens within the correct context block
             _current_user_id.reset(_uid_token)
