@@ -44,9 +44,10 @@ async def research_topic(query: str) -> str:
                 RESEARCH_AGENT_URL, query[:100], user_id or "anonymous")
 
     _MAX_RETRIES = 2
+    _RETRY_DELAY = 2  # linear backoff — avoids compounding delay on flaky agent
     for attempt in range(_MAX_RETRIES):
         try:
-            async with httpx.AsyncClient(timeout=300.0) as client:
+            async with httpx.AsyncClient(timeout=45.0) as client:
                 response = await client.post(
                     f"{RESEARCH_AGENT_URL}/ask",
                     json={"query": enriched_query},
@@ -67,9 +68,9 @@ async def research_topic(query: str) -> str:
                 return f"Research agent error (HTTP {e.response.status_code}). It may be unavailable."
             logger.warning(
                 "Research agent HTTP %d (attempt %d/%d) — retrying in %ds",
-                e.response.status_code, attempt + 1, _MAX_RETRIES, 2 ** attempt,
+                e.response.status_code, attempt + 1, _MAX_RETRIES, _RETRY_DELAY,
             )
-            await asyncio.sleep(2 ** attempt)
+            await asyncio.sleep(_RETRY_DELAY)
         except httpx.ConnectError:
             if attempt == _MAX_RETRIES - 1:
                 logger.error("Cannot connect to research agent at %s", RESEARCH_AGENT_URL)
@@ -79,8 +80,8 @@ async def research_topic(query: str) -> str:
                 )
             logger.warning(
                 "Research agent unreachable (attempt %d/%d) — retrying in %ds",
-                attempt + 1, _MAX_RETRIES, 2 ** attempt,
+                attempt + 1, _MAX_RETRIES, _RETRY_DELAY,
             )
-            await asyncio.sleep(2 ** attempt)
+            await asyncio.sleep(_RETRY_DELAY)
     # Unreachable, but satisfies type checker
     return "Research agent unavailable after retries."
