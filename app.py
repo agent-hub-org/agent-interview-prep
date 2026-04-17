@@ -10,7 +10,7 @@ import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status, Depends
 from fastapi.responses import Response, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -120,7 +120,7 @@ app.mount("/a2a", a2a_app.build())
 # ── Request/Response models ──
 
 class AskRequest(BaseModel):
-    query: str
+    query: str = Field(min_length=1, max_length=8000)
     session_id: str | None = None
     response_format: str | None = None
     model_id: str | None = None
@@ -160,6 +160,13 @@ class CodebaseUploadResponse(BaseModel):
     total_files: int
     language: str
     preview: str
+
+_codebase_locks = {}
+
+def _get_codebase_lock(session_id: str) -> asyncio.Lock:
+    if session_id not in _codebase_locks:
+        _codebase_locks[session_id] = asyncio.Lock()
+    return _codebase_locks[session_id]
 
 
 # ── Standard agent endpoints ──
@@ -504,25 +511,26 @@ async def upload_codebase(
 
     logger.info("POST /upload/codebase — session='%s', url='%s'", session_id, github_url)
 
-    try:
-        agent = create_agent()
-        await agent._ensure_initialized()
-        fetch_tool = agent.tools_by_name.get("fetch_github_repo")
-        if fetch_tool is None:
-            raise HTTPException(status_code=503, detail="fetch_github_repo tool not available on MCP server")
-        raw = await fetch_tool.ainvoke({"repo_url": github_url})
-        if isinstance(raw, str) and raw.startswith("Error:"):
-            raise ValueError(raw[len("Error:"):].strip())
-        codebase_doc = json.loads(raw) if isinstance(raw, str) else raw
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Unexpected error fetching GitHub repo '%s': %s", github_url, e)
-        raise HTTPException(status_code=500, detail="Failed to fetch repository. Please check the URL and try again.")
+    async with _get_codebase_lock(session_id):
+        try:
+            agent = create_agent()
+            await agent._ensure_initialized()
+            fetch_tool = agent.tools_by_name.get("fetch_github_repo")
+            if fetch_tool is None:
+                raise HTTPException(status_code=503, detail="fetch_github_repo tool not available on MCP server")
+            raw = await fetch_tool.ainvoke({"repo_url": github_url})
+            if isinstance(raw, str) and raw.startswith("Error:"):
+                raise ValueError(raw[len("Error:"):].strip())
+            codebase_doc = json.loads(raw) if isinstance(raw, str) else raw
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("Unexpected error fetching GitHub repo '%s': %s", github_url, e)
+            raise HTTPException(status_code=500, detail="Failed to fetch repository. Please check the URL and try again.")
 
-    await MongoDB.store_codebase(session_id=session_id, codebase_doc=codebase_doc)
+        await MongoDB.store_codebase(session_id=session_id, codebase_doc=codebase_doc)
 
     preview_lines = codebase_doc["summary"].splitlines()[:6]
     preview = "\n".join(preview_lines)
