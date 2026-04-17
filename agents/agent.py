@@ -12,6 +12,7 @@ from tools.resume_parser import parse_resume
 from tools.research_client import research_topic, _current_user_id
 from tools.note_generator import generate_study_notes
 from tools.codebase_parser import analyze_codebase
+from tools.srs import record_attempt, get_due_questions, get_srs_stats
 
 logger = logging.getLogger("agent_interview_prep.agent")
 
@@ -49,6 +50,14 @@ posting analysis or company research pages.
 - `analyze_codebase(session_id: str)` — Retrieve the GitHub repository uploaded by the \
 user for this session. Returns repo metadata, file tree, and key file contents. \
 Call this ONCE at the start of Codebase Interview Mode to load the repo.
+
+**Spaced Repetition (SRS) tools:**
+- `srs_record_attempt(user_id: str, question: str, topic: str, quality: int, session_id: str)` — \
+Record how well the user answered a question (quality 0–5: 0=complete blank, 3=correct but hard, \
+5=perfect). SM-2 scheduling computes the next review date. Call after every mock interview answer.
+- `get_due_questions(user_id: str, limit: int)` — Return questions the user should review today \
+based on SM-2 scheduling. Call at the start of a review session.
+- `get_srs_stats(user_id: str)` — Return deck statistics: total, due today, mastered, learning.
 
 **Important:** Only use the tools listed above. Ignore any other tools that may be \
 available (paper-related, finance-related, vector DB tools) — they are not relevant \
@@ -101,17 +110,23 @@ patterns")
 
 ### Mock Interview Mode:
 When the user asks for a mock interview or practice questions:
-1. Ask what type: technical (coding, system design) or behavioral
-2. Ask one question at a time — do NOT dump multiple questions
-3. Wait for the user's answer before proceeding
-4. After each answer, provide specific feedback on:
+1. If `user_id` is available, call `get_due_questions` first to check if any previously \
+   asked questions are due for review — prioritize those before new ones.
+2. Ask what type: technical (coding, system design) or behavioral (skip if due questions exist)
+3. Ask one question at a time — do NOT dump multiple questions
+4. Wait for the user's answer before proceeding
+5. After each answer, provide specific feedback on:
    - **Content accuracy** — was the answer technically correct?
    - **Communication clarity** — was it well-structured and easy to follow?
    - **Structure** — for behavioral questions, did they use STAR method?
    - **Depth** — did they go deep enough or stay too surface-level?
    - **Areas for improvement** — specific, actionable suggestions
-5. Keep a running score mentally and provide a summary when the user wants to stop
-6. Suggest follow-up questions that probe deeper into weak areas
+6. After giving feedback, call `srs_record_attempt` with:
+   - quality 0–2 for wrong/incomplete answers
+   - quality 3 for correct but required hints
+   - quality 4–5 for confident, complete answers
+7. Keep a running score mentally and provide a summary when the user wants to stop
+8. Suggest follow-up questions that probe deeper into weak areas
 
 ### Codebase Interview Mode:
 When a codebase is available in context (shown under [CODEBASE]) or when the user \
@@ -225,7 +240,8 @@ def create_agent() -> BaseAgent:
     if _agent_instance is None:
         logger.info("Creating interview prep agent (singleton) with MCP servers")
         _agent_instance = BaseAgent(
-            tools=[parse_resume, research_topic, generate_study_notes, analyze_codebase],
+            tools=[parse_resume, research_topic, generate_study_notes, analyze_codebase,
+                   record_attempt, get_due_questions, get_srs_stats],
             mcp_servers=MCP_SERVERS,
             system_prompt=SYSTEM_PROMPT,
             checkpointer=_get_checkpointer(),
