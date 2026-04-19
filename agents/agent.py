@@ -13,6 +13,7 @@ from tools.research_client import research_topic, _current_user_id
 from tools.note_generator import generate_study_notes
 from tools.codebase_parser import analyze_codebase
 from tools.srs import record_attempt, get_due_questions, get_srs_stats
+from tools.prep_plan import generate_prep_plan
 
 logger = logging.getLogger("agent_interview_prep.agent")
 
@@ -40,6 +41,11 @@ downloadable study notes. If creating new notes, you compose the content (markdo
 and pick the format ("markdown" or "pdf"). If the user asks for a different format of previously \
 generated notes, extract the file ID from the previous download link, pass it as `source_file_id`, \
 and leave `content` empty. The tool saves the file and returns a download link.
+
+**Prep plan generation:**
+- `generate_prep_plan(title: str, content: str, target_company: str, role: str, days: int, format: str)` — \
+Generate a downloadable day-by-day interview preparation plan (PDF or markdown). \
+Call when the user asks for a study schedule, prep timeline, or preparation roadmap.
 
 **Web tools (via MCP):**
 - `tavily_quick_search(query: str, max_results: int)` — Web search for interview tips, \
@@ -99,6 +105,31 @@ patterns")
 4. Call `generate_study_notes` with your composed content to create the downloadable file
 5. The tool returns a download link — include it in your response
 
+### When asked to create a prep plan or study schedule:
+1. Ask (if not provided): target company, role/level, interview date or number of days available
+2. Use `tavily_quick_search` to find company-specific interview patterns:
+   - Query: "[Company] [Role] interview process 2026" and "[Company] interview questions [level]"
+   - Look for: number of rounds, question types, known focus areas, typical difficulty
+3. Divide the days into phases: Foundation → Depth → Practice → Polish
+4. For each week/phase, assign specific topics with daily tasks:
+   - Technical fundamentals relevant to the role
+   - Company-specific topics (e.g., Google's focus on system design and algorithms)
+   - Behavioral/leadership stories (STAR method) for senior levels
+   - Mock interview days (every 5-7 days)
+5. Call `generate_prep_plan` with the full plan content to produce a downloadable file
+6. Include the download link and a brief phase-by-phase summary in your response
+
+### Company-Specific Prep Packs:
+When the user names a specific company (Google, Amazon, Microsoft, Flipkart, etc.):
+1. Use `tavily_quick_search` to find: known interview format, focus areas, culture/values, recent interview experiences
+2. Map the company to its known interview style:
+   - **FAANG (Google/Meta/Apple/Amazon/Netflix)**: Heavy algorithm + data structures + system design
+   - **Amazon**: Leadership Principles (LP) behavioral questions — ask which 2-3 LPs to focus on
+   - **Microsoft**: Product design + system design + collaborative coding style
+   - **Startups/Indian tech (Flipkart/Swiggy/Razorpay)**: Practical problem-solving, system design, past impact
+3. Surface: common question categories, what interviewers look for, typical red flags, negotiation tips
+4. Offer to generate notes or a prep plan focused specifically on that company
+
 ### When asked to analyze a job description:
 1. If the user provides a URL, use `firecrawl_deep_scrape` to extract the full JD content
 2. If the user pastes the JD text, analyze it directly
@@ -125,8 +156,14 @@ When the user asks for a mock interview or practice questions:
    - quality 0–2 for wrong/incomplete answers
    - quality 3 for correct but required hints
    - quality 4–5 for confident, complete answers
-7. Keep a running score mentally and provide a summary when the user wants to stop
-8. Suggest follow-up questions that probe deeper into weak areas
+7. Score each answer across 4 dimensions (1–10 each):
+   - **Accuracy**: Technical correctness
+   - **Clarity**: Communication and structure
+   - **Depth**: How deep the answer went
+   - **STAR**: For behavioral questions — how well they followed Situation/Task/Action/Result
+   Announce scores after each answer: "Scores — Accuracy: 8/10, Clarity: 7/10, Depth: 6/10"
+8. At end of session, summarize overall performance: average scores per dimension, strongest area, biggest gap, 1-2 specific things to practice before the real interview
+9. Suggest follow-up questions that probe deeper into weak areas
 
 ### Codebase Interview Mode:
 When a codebase is available in context (shown under [CODEBASE]) or when the user \
@@ -241,7 +278,7 @@ def create_agent() -> BaseAgent:
         logger.info("Creating interview prep agent (singleton) with MCP servers")
         _agent_instance = BaseAgent(
             tools=[parse_resume, research_topic, generate_study_notes, analyze_codebase,
-                   record_attempt, get_due_questions, get_srs_stats],
+                   record_attempt, get_due_questions, get_srs_stats, generate_prep_plan],
             mcp_servers=MCP_SERVERS,
             system_prompt=SYSTEM_PROMPT,
             checkpointer=_get_checkpointer(),

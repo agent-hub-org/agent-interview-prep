@@ -550,6 +550,96 @@ async def metrics_endpoint():
     return Response(content=content, media_type=content_type)
 
 
+# ── Mock interview score endpoints ──
+
+class MockScoreRequest(BaseModel):
+    session_id: str
+    question: str
+    topic: str
+    accuracy: int = Field(ge=1, le=10)
+    clarity: int = Field(ge=1, le=10)
+    depth: int = Field(ge=1, le=10)
+    star: int | None = Field(default=None, ge=1, le=10, description="STAR score for behavioral questions")
+    notes: str = ""
+
+
+@app.post("/scores")
+@limiter.limit("60/minute")
+async def record_score(body: MockScoreRequest, request: Request):
+    """Record a mock interview question score for a session."""
+    user_id = request.headers.get("X-User-Id") or None
+    await MongoDB.save_score(
+        user_id=user_id,
+        session_id=body.session_id,
+        question=body.question,
+        topic=body.topic,
+        accuracy=body.accuracy,
+        clarity=body.clarity,
+        depth=body.depth,
+        star=body.star,
+        notes=body.notes,
+    )
+    return {"success": True}
+
+
+@app.get("/scores/{session_id}")
+@limiter.limit("60/minute")
+async def get_scores(session_id: str, request: Request):
+    """Retrieve all mock interview scores for a session."""
+    user_id = request.headers.get("X-User-Id") or None
+    scores = await MongoDB.get_scores(session_id, user_id=user_id)
+    return {"session_id": session_id, "scores": scores}
+
+
+@app.get("/scores/user/me")
+@limiter.limit("60/minute")
+async def get_user_scores(request: Request):
+    """Retrieve all mock interview scores for the current user across sessions."""
+    user_id = request.headers.get("X-User-Id") or None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    scores = await MongoDB.get_user_scores(user_id)
+    return {"user_id": user_id, "scores": scores}
+
+
+# ── Shareable notes endpoint ──
+
+class ShareNoteRequest(BaseModel):
+    file_id: str
+
+
+@app.post("/notes/share")
+@limiter.limit("20/minute")
+async def create_share_token(body: ShareNoteRequest, request: Request):
+    """Create a shareable public token for a notes file."""
+    user_id = request.headers.get("X-User-Id") or None
+    file_meta = await MongoDB.get_file(body.file_id)
+    if not file_meta:
+        raise HTTPException(status_code=404, detail="File not found")
+    share_token = await MongoDB.create_share_token(body.file_id, user_id=user_id)
+    base = (os.getenv("BACKEND_URL") or os.getenv("PUBLIC_URL") or "").rstrip("/")
+    return {"share_token": share_token, "share_url": f"{base}/notes/shared/{share_token}"}
+
+
+@app.get("/notes/shared/{token}")
+async def download_shared_note(token: str):
+    """Download a shared note using a public token (no auth required)."""
+    file_id = await MongoDB.resolve_share_token(token)
+    if not file_id:
+        raise HTTPException(status_code=404, detail="Shared link not found or expired")
+    result = await MongoDB.retrieve_file(file_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="File not found")
+    data, meta = result
+    filename = meta.get("filename", "notes")
+    media_type = "application/pdf" if filename.endswith(".pdf") else "text/markdown"
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.get("/health")
 async def health():
     """Service health check with dependency verification."""
