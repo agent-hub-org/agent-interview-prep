@@ -5,8 +5,7 @@ import os
 import re
 import tempfile
 import uuid
-import time
-import threading
+from collections import defaultdict
 from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status, Depends
@@ -48,8 +47,14 @@ async def lifespan(app: FastAPI):
     if not os.getenv("INTERNAL_API_KEY"):
         logger.warning("INTERNAL_API_KEY is not set — internal API is unprotected. Set this in production.")
     agent = create_agent()
-    await agent._ensure_initialized()
-    logger.info("MCP servers connected, agent ready")
+    try:
+        await agent._ensure_initialized()
+        if getattr(agent, '_degraded', False):
+            logger.warning("Agent started in DEGRADED mode — MCP tools unavailable")
+        else:
+            logger.info("MCP servers connected, agent ready")
+    except Exception as e:
+        logger.error("Agent initialization failed (continuing without MCP): %s", e)
     await MongoDB.ensure_indexes()
     yield
     await agent._disconnect_mcp()
@@ -163,30 +168,10 @@ class CodebaseUploadResponse(BaseModel):
     language: str
     preview: str
 
-class LockCache:
-    def __init__(self, ttl: int = 3600):
-        self._locks = {}
-        self._timestamps = {}
-        self._ttl = ttl
-        self._mutex = threading.Lock()
-
-    def get_lock(self, session_id: str) -> asyncio.Lock:
-        with self._mutex:
-            now = time.time()
-            expired = [sid for sid, ts in self._timestamps.items() if now - ts > self._ttl]
-            for sid in expired:
-                if sid in self._locks and not self._locks[sid].locked():
-                    del self._locks[sid]
-                    del self._timestamps[sid]
-            if session_id not in self._locks:
-                self._locks[session_id] = asyncio.Lock()
-            self._timestamps[session_id] = now
-            return self._locks[session_id]
-
-_codebase_locks_cache = LockCache()
+_codebase_locks_cache: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 def _get_codebase_lock(session_id: str) -> asyncio.Lock:
-    return _codebase_locks_cache.get_lock(session_id)
+    return _codebase_locks_cache[session_id]
 
 
 # ── Standard agent endpoints ──
@@ -273,7 +258,7 @@ async def ask_stream(body: AskRequest, request: Request):
         _rid_token = _current_request_id.set(_incoming_request_id)
 
         full_response = []
-        queue = asyncio.Queue()
+        queue = asyncio.Queue(maxsize=100)
         _PROGRESS_PREFIX = "__PROGRESS__:"
         _HEARTBEAT_INTERVAL = 15.0
 
@@ -289,7 +274,11 @@ async def ask_stream(body: AskRequest, request: Request):
             try:
                 async with asyncio.timeout(_STREAM_TIMEOUT):
                     async for chunk in stream:
-                        await queue.put(chunk)
+                        try:
+                            await asyncio.wait_for(queue.put(chunk), timeout=30.0)
+                        except asyncio.TimeoutError:
+                            logger.warning("Stream queue full for session='%s' — client likely disconnected", session_id)
+                            return
             except TimeoutError:
                 logger.error("Stream producer timed out after %.0fs", _STREAM_TIMEOUT)
                 await queue.put(f"__ERROR__:Response timed out after {_STREAM_TIMEOUT:.0f} seconds.")
@@ -297,7 +286,10 @@ async def ask_stream(body: AskRequest, request: Request):
                 logger.error("Stream producer failed: %s", exc)
                 await queue.put("__ERROR__:An internal error occurred while generating the response.")
             finally:
-                await queue.put(None)
+                try:
+                    queue.put_nowait(None)
+                except asyncio.QueueFull:
+                    pass
 
         heartbeat_task = asyncio.create_task(heartbeat_worker())
         agent_task = asyncio.create_task(agent_worker())
@@ -344,7 +336,11 @@ async def ask_stream(body: AskRequest, request: Request):
             
         finally:
             heartbeat_task.cancel()
-            await agent_task
+            agent_task.cancel()
+            try:
+                await agent_task
+            except asyncio.CancelledError:
+                pass
             yield "data: [DONE]\n\n"
             # Safely reset the tokens within the correct context block
             _current_user_id.reset(_uid_token)
