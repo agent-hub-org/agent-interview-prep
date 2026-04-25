@@ -1,3 +1,6 @@
+from agent_sdk.secrets.akv import load_akv_secrets
+load_akv_secrets()
+
 import asyncio
 import json
 import logging
@@ -47,6 +50,8 @@ MAX_RESUME_SIZE = 10 * 1024 * 1024  # 10 MB
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from agent_sdk.observability import init_sentry
+    init_sentry("agent-interview-prep")
     validate_required_env_vars(
         ["MONGO_URI", "AZURE_AI_FOUNDRY_ENDPOINT", "AZURE_AI_FOUNDRY_API_KEY",
          "PINECONE_API_KEY"],
