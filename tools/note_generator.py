@@ -1,125 +1,28 @@
 import logging
 import os
 import re
-import tempfile
 import uuid
 from datetime import datetime, timezone
 
 from langchain_core.tools import tool
+from agent_sdk.utils.pdf import MarkdownPDFRenderer, slugify
 
 logger = logging.getLogger("agent_interview_prep.tools.note_generator")
 
 _BASE_URL = (os.getenv("BACKEND_URL") or os.getenv("PUBLIC_URL") or "").rstrip("/")
-
-
-_UNICODE_TO_ASCII = str.maketrans({
-    # Greek letters (lowercase)
-    "α": "alpha", "β": "beta",  "γ": "gamma", "δ": "delta",
-    "ε": "epsilon","ζ": "zeta", "η": "eta",   "θ": "theta",
-    "λ": "lambda", "μ": "mu",   "ξ": "xi",   "π": "pi",
-    "σ": "sigma",  "τ": "tau",  "φ": "phi",  "χ": "chi",
-    "ψ": "psi",    "ω": "omega",
-    # Greek letters (uppercase)
-    "Γ": "Gamma", "Δ": "Delta", "Θ": "Theta", "Λ": "Lambda",
-    "Σ": "Sigma",  "Φ": "Phi",  "Ψ": "Psi",  "Ω": "Omega",
-    # Math operators / symbols
-    "∑": "sum",   "∏": "prod",  "∫": "integral",
-    "∈": "in",    "∉": "not in","⊂": "subset","⊆": "subset=",
-    "∪": "union", "∩": "intersect",
-    "≤": "<=",    "≥": ">=",   "≠": "!=",
-    "→": "->",    "←": "<-",   "↔": "<->",
-    "∞": "inf",   "∂": "d",    "∇": "nabla",
-    "⊤": "^T",    "⊥": "perp",
-    "·": ".",
-})
-
-
-def _strip_latex_math(text: str) -> str:
-    """Remove LaTeX $$...$$ and $...$ delimiters, keeping the inner expression."""
-    text = re.sub(r'\$\$(.*?)\$\$', r'\1', text, flags=re.DOTALL)
-    text = re.sub(r'\$(.*?)\$', r'\1', text)
-    return text
-
-
-def _sanitize_for_pdf(text: str) -> str:
-    """Transliterate Unicode math symbols to ASCII equivalents for Helvetica compatibility."""
-    return text.translate(_UNICODE_TO_ASCII)
-
-
-def _slugify(text: str) -> str:
-    """Convert text to a URL-friendly slug."""
-    text = text.lower().strip()
-    text = re.sub(r"[^\w\s-]", "", text)
-    text = re.sub(r"[\s_]+", "-", text)
-    return text[:50]
+_pdf_renderer = MarkdownPDFRenderer()
 
 
 def _generate_toc(content: str) -> str:
-    """Generate a table of contents from markdown headings."""
     toc_lines = []
     for line in content.split("\n"):
         if line.startswith("## "):
             heading = line[3:].strip()
-            anchor = _slugify(heading)
-            toc_lines.append(f"- [{heading}](#{anchor})")
+            toc_lines.append(f"- [{heading}](#{slugify(heading)})")
         elif line.startswith("### "):
             heading = line[4:].strip()
-            anchor = _slugify(heading)
-            toc_lines.append(f"  - [{heading}](#{anchor})")
+            toc_lines.append(f"  - [{heading}](#{slugify(heading)})")
     return "\n".join(toc_lines)
-
-
-def _create_pdf_bytes(title: str, markdown_content: str) -> bytes:
-    """Generate a PDF from markdown content using fpdf2. Returns bytes."""
-    from fpdf import FPDF
-
-    # Preprocess: strip LaTeX math delimiters and transliterate Unicode
-    # symbols to ASCII so Helvetica can render them without errors.
-    markdown_content = _sanitize_for_pdf(_strip_latex_math(markdown_content))
-    title = _sanitize_for_pdf(title)
-
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-
-    # Title
-    pdf.set_font("Helvetica", "B", 18)
-    pdf.cell(0, 12, title, new_x="LMARGIN", new_y="NEXT", align="C")
-    pdf.ln(8)
-
-    # Content - simple line-by-line rendering
-    pdf.set_font("Helvetica", size=11)
-    for line in markdown_content.split("\n"):
-        stripped = line.strip()
-
-        if stripped.startswith("# "):
-            pdf.set_font("Helvetica", "B", 16)
-            pdf.ln(4)
-            pdf.cell(0, 10, stripped[2:], new_x="LMARGIN", new_y="NEXT")
-            pdf.set_font("Helvetica", size=11)
-        elif stripped.startswith("## "):
-            pdf.set_font("Helvetica", "B", 14)
-            pdf.ln(3)
-            pdf.cell(0, 9, stripped[3:], new_x="LMARGIN", new_y="NEXT")
-            pdf.set_font("Helvetica", size=11)
-        elif stripped.startswith("### "):
-            pdf.set_font("Helvetica", "B", 12)
-            pdf.ln(2)
-            pdf.cell(0, 8, stripped[4:], new_x="LMARGIN", new_y="NEXT")
-            pdf.set_font("Helvetica", size=11)
-        elif stripped.startswith("- ") or stripped.startswith("* "):
-            bullet_text = stripped[2:]
-            bullet_text = re.sub(r"\*\*(.*?)\*\*", r"\1", bullet_text)
-            pdf.cell(8)
-            pdf.multi_cell(0, 6, f"• {bullet_text}")
-        elif stripped:
-            plain = re.sub(r"\*\*(.*?)\*\*", r"\1", stripped)
-            plain = re.sub(r"\*(.*?)\*", r"\1", plain)
-            pdf.multi_cell(0, 6, plain)
-        else:
-            pdf.ln(3)
-
-    return pdf.output()
 
 
 @tool
@@ -147,11 +50,11 @@ async def generate_study_notes(title: str, content: str, format: str = "markdown
         except Exception:
             return f"Error: source file is not valid text/markdown."
         title = title or "Study_Notes"
-        slug = _slugify(title)
+        slug = slugify(title, max_len=50)
         full_content = retrieved_content
         pdf_content = retrieved_content
     else:
-        slug = _slugify(title)
+        slug = slugify(title, max_len=50)
         # Add TOC to markdown content
         toc = _generate_toc(content)
         full_content = f"# {title}\n\n## Table of Contents\n{toc}\n\n---\n\n{content}"
@@ -165,7 +68,7 @@ async def generate_study_notes(title: str, content: str, format: str = "markdown
 
     try:
         if format == "pdf":
-            file_bytes = _create_pdf_bytes(title, pdf_content)
+            file_bytes = _pdf_renderer.render(pdf_content, title)
         else:
             file_bytes = full_content.encode("utf-8")
 

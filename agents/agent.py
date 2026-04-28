@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import asyncio
 from agent_sdk.agents import BaseAgent
-from agent_sdk.checkpoint import AsyncMongoDBSaver
+from agent_sdk.checkpoint import get_default_checkpointer
 from agent_sdk.database.memory import get_memories, save_memory
 from database.mongo import MongoDB
 from tools.resume_parser import parse_resume
@@ -236,7 +236,6 @@ MCP_SERVERS = {
 }
 
 _agent_instance: BaseAgent | None = None
-_checkpointer: AsyncMongoDBSaver | None = None
 
 RESPONSE_FORMAT_INSTRUCTIONS = {
     "summary": (
@@ -261,17 +260,6 @@ RESPONSE_FORMAT_INSTRUCTIONS = {
     "detailed": "",
 }
 
-def _get_checkpointer() -> AsyncMongoDBSaver:
-    global _checkpointer
-    if _checkpointer is None:
-        _checkpointer = AsyncMongoDBSaver.from_conn_string(
-            conn_string=os.getenv("MONGO_URI", "mongodb://localhost:27017"),
-            db_name=os.getenv("MONGO_DB_NAME", "agent_interview_prep"),
-            ttl=int(os.getenv("CHECKPOINT_TTL_SECONDS", str(7 * 24 * 3600))),
-        )
-    return _checkpointer
-
-
 def create_agent() -> BaseAgent:
     global _agent_instance
     if _agent_instance is None:
@@ -281,15 +269,12 @@ def create_agent() -> BaseAgent:
                    record_attempt, get_due_questions, get_srs_stats, generate_prep_plan],
             mcp_servers=MCP_SERVERS,
             system_prompt=SYSTEM_PROMPT,
-            checkpointer=_get_checkpointer(),
+            checkpointer=get_default_checkpointer(os.getenv("MONGO_DB_NAME", "agent_interview_prep")),
         )
     return _agent_instance
 
 
-_TRIVIAL_FOLLOWUPS: frozenset[str] = frozenset({
-    "yes", "no", "sure", "ok", "okay", "please", "yes please",
-    "no thanks", "proceed", "go ahead", "continue", "yeah", "yep",
-})
+from agent_sdk.utils.text import TRIVIAL_FOLLOWUPS as _TRIVIAL_FOLLOWUPS
 
 
 def _build_system_prompt(response_format: str | None = None) -> str:
@@ -336,7 +321,10 @@ async def _build_dynamic_context(session_id: str, query: str, response_format: s
         parts.append(f"Note: {mem_err}")
         logger.warning("Mem0 degradation for session='%s': %s", session_id, mem_err)
 
-    resume_doc = await MongoDB.get_resume(session_id)
+    resume_doc, codebase_doc = await asyncio.gather(
+        MongoDB.get_resume(session_id),
+        MongoDB.get_codebase(session_id),
+    )
     if resume_doc:
         parts.append(
             f"User's resume (uploaded — reference for personalized advice):\n"
@@ -345,7 +333,6 @@ async def _build_dynamic_context(session_id: str, query: str, response_format: s
         )
         logger.info("Injected resume into context for session='%s'", session_id)
 
-    codebase_doc = await MongoDB.get_codebase(session_id)
     if codebase_doc:
         parts.append(
             f"[CODEBASE]\n"

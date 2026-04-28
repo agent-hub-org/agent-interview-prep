@@ -11,20 +11,17 @@ import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status, Depends
-from fastapi.responses import Response, StreamingResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
-from slowapi import Limiter
-from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 
 from agent_sdk.logging import configure_logging
-from agent_sdk.middleware.infra import RequestIDMiddleware, SecurityHeadersMiddleware, VerifyInternalKeyMiddleware
 from agent_sdk.utils.env import validate_required_env_vars
 from agent_sdk.utils.validation import SAFE_SESSION_RE
-from agent_sdk.server.error_handlers import register_error_handlers
 from agent_sdk.metrics import metrics_response
+from agent_sdk.server.app_factory import create_agent_app
+from agent_sdk.server.models import AskRequest, AskResponse, HistoryResponse, SessionsHistoryRequest
+from agent_sdk.server.session import verify_session_ownership
 from agent_sdk.server.streaming import StreamingMathFixer, _fix_math_delimiters
 from agents.agent import create_agent, run_query, create_stream, save_memory
 from database.mongo import MongoDB
@@ -34,7 +31,6 @@ from tools.research_client import _current_user_id, _current_request_id
 
 configure_logging("agent_interview_prep")
 logger = logging.getLogger("agent_interview_prep.api")
-limiter = Limiter(key_func=get_remote_address)
 
 _GITHUB_REPO_RE = re.compile(
     r'^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(/[^\s]*)?$'
@@ -75,64 +71,10 @@ async def lifespan(app: FastAPI):
     logger.info("Shutdown complete")
 
 
-async def _rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> Response:
-    """Custom handler for RateLimitExceeded to return a JSON response."""
-    return Response(
-        content=json.dumps({"detail": "Rate limit exceeded. Please try again later."}),
-        status_code=429,
-        media_type="application/json",
-    )
+app, limiter = create_agent_app("Interview Prep Agent API", lifespan)
 
-app = FastAPI(
-    title="Interview Prep Agent API",
-    description="AI-powered interview preparation assistant with resume analysis and study material generation.",
-    lifespan=lifespan,
-)
-
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-register_error_handlers(app)
-
-_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:5173")
-_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_allowed_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-Internal-API-Key", "X-User-Id", "X-Request-ID"],
-)
-app.add_middleware(SecurityHeadersMiddleware)
-app.add_middleware(RequestIDMiddleware)
-app.add_middleware(VerifyInternalKeyMiddleware)
-
-# Mount the A2A server as a sub-application
 a2a_app = create_a2a_app()
 app.mount("/a2a", a2a_app.build())
-
-
-# ── Request/Response models ──
-
-class AskRequest(BaseModel):
-    query: str = Field(min_length=1, max_length=8000)
-    session_id: str | None = None
-    response_format: str | None = None
-    model_id: str | None = None
-
-    model_config = {"json_schema_extra": {"examples": [{"query": "", "session_id": None, "response_format": "detailed", "model_id": None}]}}
-
-
-
-
-class AskResponse(BaseModel):
-    session_id: str
-    query: str
-    response: str
-
-
-class HistoryResponse(BaseModel):
-    session_id: str
-    history: list[dict]
 
 
 class UploadResponse(BaseModel):
@@ -170,12 +112,8 @@ async def ask(body: AskRequest, request: Request):
     is_new = body.session_id is None
     session_id = body.session_id or MongoDB.generate_session_id()
 
-    if not is_new and user_id:
-        owned_history = await MongoDB.get_history(session_id, user_id=user_id)
-        if not owned_history:
-            any_history = await MongoDB.get_history(session_id)
-            if any_history:
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    if not is_new:
+        await verify_session_ownership(session_id, user_id, MongoDB)
 
     logger.info("POST /ask — session='%s' (%s), user='%s', query='%s'",
                 session_id, "new" if is_new else "existing", user_id or "anonymous", body.query[:100])
@@ -220,12 +158,9 @@ async def ask_stream(body: AskRequest, request: Request):
     is_new = body.session_id is None
     session_id = body.session_id or MongoDB.generate_session_id()
 
-    if not is_new and user_id:
-        owned_history = await MongoDB.get_history(session_id, user_id=user_id)
-        if not owned_history:
-            any_history = await MongoDB.get_history(session_id)
-            if any_history:
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    if not is_new:
+        await verify_session_ownership(session_id, user_id, MongoDB)
+
     logger.info("POST /ask/stream — session='%s', user='%s', query='%s'",
                 session_id, user_id or "anonymous", body.query[:100])
 
@@ -356,9 +291,6 @@ async def get_history(request: Request, session_id: str):
     logger.info("Returning %d history entries for session='%s'", len(history), session_id)
     return HistoryResponse(session_id=session_id, history=history)
 
-
-class SessionsHistoryRequest(BaseModel):
-    session_ids: list[str]
 
 @app.post("/history/sessions")
 @limiter.limit("30/minute")

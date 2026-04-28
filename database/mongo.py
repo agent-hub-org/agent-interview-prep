@@ -2,16 +2,15 @@ import logging
 import os
 from datetime import datetime, timezone
 
-from motor.motor_asyncio import AsyncIOMotorGridFSBucket
 from agent_sdk.database.mongo import BaseMongoDatabase
+from agent_sdk.database.gridfs_mixin import GridFSMixin
 
 logger = logging.getLogger("agent_interview_prep.mongo")
 
 _DB_NAME = os.getenv("MONGO_DB_NAME", "agent_interview_prep")
 
 
-class MongoDB(BaseMongoDatabase):
-    _gridfs: AsyncIOMotorGridFSBucket | None = None
+class MongoDB(GridFSMixin, BaseMongoDatabase):
 
     @classmethod
     def db_name(cls) -> str:
@@ -20,12 +19,6 @@ class MongoDB(BaseMongoDatabase):
     @classmethod
     def _db(cls):
         return cls.get_client()[cls.db_name()]
-
-    @classmethod
-    def _gridfs_bucket(cls) -> AsyncIOMotorGridFSBucket:
-        if cls._gridfs is None:
-            cls._gridfs = AsyncIOMotorGridFSBucket(cls._db())
-        return cls._gridfs
 
     @classmethod
     def _files(cls):
@@ -109,48 +102,6 @@ class MongoDB(BaseMongoDatabase):
             {"session_id": session_id},
             {"_id": 0},
         )
-
-    # ── File storage (GridFS for Railway persistence) ──
-
-    @classmethod
-    async def store_file(cls, file_id: str, filename: str, data: bytes,
-                         file_type: str, session_id: str | None = None) -> None:
-        """Store file content in MongoDB GridFS and save metadata."""
-        bucket = cls._gridfs_bucket()
-        await bucket.upload_from_stream(
-            file_id,  # use file_id as the GridFS filename for easy lookup
-            data,
-            metadata={
-                "file_id": file_id,
-                "original_filename": filename,
-                "file_type": file_type,
-                "session_id": session_id,
-            },
-        )
-        # Also save metadata in the files collection for quick queries
-        doc = {
-            "file_id": file_id,
-            "filename": filename,
-            "file_type": file_type,
-            "session_id": session_id,
-            "created_at": datetime.now(timezone.utc),
-        }
-        await cls._files().insert_one(doc)
-        logger.info("Stored file in GridFS — file_id='%s', type='%s', size=%d bytes",
-                     file_id, file_type, len(data))
-
-    @classmethod
-    async def retrieve_file(cls, file_id: str) -> tuple[bytes, dict] | None:
-        """Retrieve file content from GridFS. Returns (data, metadata) or None."""
-        bucket = cls._gridfs_bucket()
-        try:
-            stream = await bucket.open_download_stream_by_name(file_id)
-            data = await stream.read()
-            meta = await cls._files().find_one({"file_id": file_id}, {"_id": 0})
-            return data, meta or {}
-        except Exception:
-            logger.warning("File not found in GridFS: file_id='%s'", file_id)
-            return None
 
     @classmethod
     async def get_file(cls, file_id: str) -> dict | None:

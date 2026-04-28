@@ -9,26 +9,18 @@ SM-2 reference: https://www.supermemo.com/en/archives1990-2015/english/ol/sm2
 from __future__ import annotations
 
 import logging
-import os
 import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from langchain_core.tools import tool
-from motor.motor_asyncio import AsyncIOMotorClient
+from database.mongo import MongoDB
 
 logger = logging.getLogger("agent_interview_prep.srs")
 
-_MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-_DB_NAME = os.getenv("MONGO_DB_NAME", "agent_interview_prep")
-_client: AsyncIOMotorClient | None = None
-
 
 def _get_collection():
-    global _client
-    if _client is None:
-        _client = AsyncIOMotorClient(_MONGO_URI)
-    return _client[_DB_NAME]["srs_questions"]
+    return MongoDB.get_client()[MongoDB.db_name()]["srs_questions"]
 
 
 def _sm2_next(easiness: float, interval: int, repetitions: int, quality: int) -> tuple[float, int, int]:
