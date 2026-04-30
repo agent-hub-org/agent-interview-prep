@@ -1,6 +1,6 @@
 import os
 
-from a2a.types import AgentCard, AgentSkill, AgentCapabilities
+from a2a.types import AgentCard, AgentCapabilities, AgentInterface, AgentSkill
 
 
 INTERVIEW_PREP_AGENT_CARD = AgentCard(
@@ -11,7 +11,12 @@ INTERVIEW_PREP_AGENT_CARD = AgentCard(
         "mock interviews, and performs job description gap analysis for "
         "software engineering and tech roles."
     ),
-    url=os.getenv("AGENT_PUBLIC_URL", "http://localhost:9003"),
+    supported_interfaces=[
+        AgentInterface(
+            url=os.getenv("AGENT_PUBLIC_URL", "http://localhost:9003"),
+            protocol_binding="JSONRPC",
+        )
+    ],
     version="1.0.0",
     skills=[
         AgentSkill(
@@ -49,7 +54,7 @@ INTERVIEW_PREP_AGENT_CARD = AgentCard(
             tags=["codebase", "code-review", "github", "technical-interview", "design-decisions"],
         ),
     ],
-    defaultInputModes=["text"],
-    defaultOutputModes=["text"],
-    capabilities=AgentCapabilities(streaming=True, pushNotifications=False),
+    default_input_modes=["text"],
+    default_output_modes=["text"],
+    capabilities=AgentCapabilities(streaming=True, push_notifications=False),
 )
